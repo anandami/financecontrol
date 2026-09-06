@@ -1,0 +1,22 @@
+{
+  "name": "controle-despesas",
+  "version": "1.0.0",
+  "description": "Bot do Telegram que registra despesas em uma planilha Google Sheets via IA",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "jest",
+    "push": "clasp push",
+    "open": "clasp open"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@google/clasp": "^3.4.1",
+    "jest": "^30.5.0"
+  }
+}

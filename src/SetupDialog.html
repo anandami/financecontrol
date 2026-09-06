@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        font-size: 13px;
+        color: #202124;
+        padding: 4px 4px 12px;
+      }
+      p {
+        color: #444;
+        line-height: 1.4;
+      }
+      label {
+        display: block;
+        margin-top: 14px;
+        font-weight: bold;
+      }
+      input[type='text'] {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 6px;
+        margin-top: 4px;
+        font-size: 13px;
+      }
+      button {
+        margin-top: 18px;
+        padding: 8px 18px;
+        background: #1a73e8;
+        color: #fff;
+        border: none;
+        border-radius: 4px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #9aa0a6;
+        cursor: default;
+      }
+      #status {
+        margin-top: 12px;
+        font-weight: bold;
+      }
+      #status.ok {
+        color: #188038;
+      }
+      #status.error {
+        color: #d93025;
+      }
+      .hint {
+        font-weight: normal;
+        color: #5f6368;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <p>
+      Cole o token do bot (do @BotFather) e a chave do Gemini (do
+      aistudio.google.com). O resto — gerar o segredo do webhook e registrar
+      no Telegram — é feito automaticamente.
+    </p>
+
+    <label for="botToken">Token do bot (BotFather)</label>
+    <input type="text" id="botToken" placeholder="123456789:AA..." />
+
+    <label for="geminiKey">Chave da API do Gemini</label>
+    <input type="text" id="geminiKey" placeholder="AIza..." />
+
+    <label for="webAppUrl">URL do Web App <span class="hint">(deixe em branco — só preencha se pedirmos)</span></label>
+    <input type="text" id="webAppUrl" placeholder="https://script.google.com/macros/s/.../exec" />
+
+    <button id="submitBtn" onclick="submitForm()">Configurar</button>
+    <div id="status"></div>
+
+    <script>
+      google.script.run.withSuccessHandler(function (saved) {
+        if (saved.botToken) document.getElementById('botToken').value = saved.botToken;
+        if (saved.geminiApiKey) document.getElementById('geminiKey').value = saved.geminiApiKey;
+      }).getSavedCredentials();
+
+      function submitForm() {
+        var botToken = document.getElementById('botToken').value;
+        var geminiKey = document.getElementById('geminiKey').value;
+        var webAppUrl = document.getElementById('webAppUrl').value;
+        var statusEl = document.getElementById('status');
+        var btn = document.getElementById('submitBtn');
+
+        statusEl.className = '';
+        statusEl.textContent = 'Configurando...';
+        btn.disabled = true;
+
+        google.script.run
+          .withSuccessHandler(function (result) {
+            btn.disabled = false;
+            statusEl.className = result.ok ? 'ok' : 'error';
+            statusEl.textContent = result.message;
+          })
+          .withFailureHandler(function (error) {
+            btn.disabled = false;
+            statusEl.className = 'error';
+            statusEl.textContent = 'Erro inesperado: ' + error.message;
+          })
+          .runSetup(botToken, geminiKey, webAppUrl);
+      }
+    </script>
+  </body>
+</html>
