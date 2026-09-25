@@ -117,8 +117,26 @@ var GEMINI_RETRY_BASE_DELAY_MS = 1000;
 // resolve — o caminho é trocar de modelo (ver callGemini/GEMINI_MODELS).
 var GEMINI_RETRYABLE_STATUS_CODES = [503];
 
-/** Uma tentativa de generateContent contra um modelo específico, com até `maxRetries` retentativas para erros transitórios (503). */
-function requestGemini_(model, parts, generationConfig, maxRetries) {
+// Orçamento de tempo da cadeia inteira de modelos. O Apps Script mata a
+// execução em 6 min ("Tempo limite atingido") e aí o dono não recebe NEM a
+// mensagem de erro — visto no painel de Execuções (360s, e várias de 290-357s
+// com o par antigo de modelos). Sob "high demand" o 503 pode levar ~60s para
+// voltar (visto ao vivo no gemma-4-31b-it: 62s), então uma tentativa só começa
+// se couber mais uma chamada nesse pior caso antes do fim do orçamento; o que
+// sobra do limite fica para o resto do doPost e para avisar o erro no Telegram.
+var GEMINI_TIME_BUDGET_MS = 300000;
+var GEMINI_CALL_WORST_CASE_MS = 65000;
+// Só vale retentar o MESMO modelo se o 503 voltou rápido (soluço momentâneo).
+// Um 503 que demorou é modelo congestionado: retentar só queima o orçamento
+// que faria falta pros modelos de reserva.
+var GEMINI_FAST_FAILURE_MS = 10000;
+
+/**
+ * Uma tentativa de generateContent contra um modelo específico, com até
+ * `maxRetries` retentativas para 503 rápidos. Não começa nenhuma tentativa que
+ * possa passar de `deadline` (lança um erro com `outOfTime = true`).
+ */
+function requestGemini_(model, parts, generationConfig, maxRetries, deadline) {
   var url = GEMINI_API_BASE + model + ':generateContent?key=' + getGeminiApiKey();
   var payload = {
     contents: [{ parts: parts }],
@@ -126,6 +144,11 @@ function requestGemini_(model, parts, generationConfig, maxRetries) {
   };
 
   for (var attempt = 0; ; attempt++) {
+    if (Date.now() + GEMINI_CALL_WORST_CASE_MS > deadline) {
+      var outOfTime = new Error('sem tempo para tentar ' + model);
+      outOfTime.outOfTime = true;
+      throw outOfTime;
+    }
     var startedAt = Date.now();
     var response = UrlFetchApp.fetch(url, {
       method: 'post',
@@ -140,7 +163,7 @@ function requestGemini_(model, parts, generationConfig, maxRetries) {
       var errorBody = response.getContentText();
       Logger.log('ai.requestGemini_: modelo=' + model + ' HTTP ' + code + ' em ' + elapsedMs + 'ms (tentativa ' + (attempt + 1) + ') - ' + errorBody);
 
-      if (GEMINI_RETRYABLE_STATUS_CODES.indexOf(code) !== -1 && attempt < maxRetries) {
+      if (GEMINI_RETRYABLE_STATUS_CODES.indexOf(code) !== -1 && attempt < maxRetries && elapsedMs < GEMINI_FAST_FAILURE_MS) {
         Utilities.sleep(GEMINI_RETRY_BASE_DELAY_MS * (attempt + 1));
         continue;
       }
@@ -170,7 +193,9 @@ function hasAudio_(parts) {
  * ordem: se um modelo falhar de vez (depois das próprias retentativas em
  * requestGemini_) por qualquer motivo — cota diária esgotada (429), sobrecarga
  * persistente (503), etc. — tenta o próximo. Modelos sem suporte a áudio são
- * pulados quando a mensagem é uma nota de voz. `responseSchema` (opcional)
+ * pulados quando a mensagem é uma nota de voz, e a cadeia para quando o
+ * orçamento de tempo (GEMINI_TIME_BUDGET_MS) não comporta mais uma tentativa,
+ * para sobrar tempo de avisar o erro. `responseSchema` (opcional)
  * força o formato exato da resposta nos modelos que suportam structured
  * output. Lança um erro com o status e o corpo da última falha se TODOS os
  * modelos falharem — Code.js repassa pro dono via Telegram. Retorna null (sem
@@ -182,7 +207,9 @@ function callGemini(parts, responseSchema) {
     return m.audio || !withAudio;
   });
 
+  var deadline = Date.now() + GEMINI_TIME_BUDGET_MS;
   var failures = [];
+  var skipped = [];
   var lastErr = null;
   for (var i = 0; i < models.length; i++) {
     var model = models[i];
@@ -195,8 +222,13 @@ function callGemini(parts, responseSchema) {
     }
 
     try {
-      return requestGemini_(model.name, parts, generationConfig, model.retries);
+      return requestGemini_(model.name, parts, generationConfig, model.retries, deadline);
     } catch (err) {
+      if (err.outOfTime) {
+        skipped = models.slice(i).map(function (m) { return m.name; });
+        Logger.log('ai.callGemini: orçamento de tempo esgotado, sem tentar ' + skipped.join(', '));
+        break;
+      }
       lastErr = err;
       failures.push(model.name);
       if (i < models.length - 1) {
@@ -205,7 +237,11 @@ function callGemini(parts, responseSchema) {
     }
   }
 
-  throw new Error('Nenhum modelo de IA respondeu (' + failures.join(', ') + '). Última falha: ' + lastErr.message);
+  throw new Error(
+    'Nenhum modelo de IA respondeu (' + failures.join(', ') + ')' +
+    (skipped.length ? '; sem tempo para tentar: ' + skipped.join(', ') : '') +
+    '. Última falha: ' + (lastErr ? lastErr.message : 'nenhuma')
+  );
 }
 
 /**

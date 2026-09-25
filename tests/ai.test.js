@@ -246,6 +246,51 @@ describe('ai.js', () => {
       expect(JSON.parse(gemmaOptions.payload).generationConfig).toEqual({});
     });
 
+    describe('com 503 lento (~60s, visto ao vivo sob "high demand")', () => {
+      let now;
+      beforeEach(() => {
+        now = 0;
+        jest.spyOn(Date, 'now').mockImplementation(() => now);
+      });
+      afterEach(() => {
+        jest.restoreAllMocks();
+      });
+
+      const slowOverloaded = () => {
+        now += 60000;
+        return { getResponseCode: () => 503, getContentText: () => '{"error":{"message":"overloaded"}}' };
+      };
+
+      it('não retenta o mesmo modelo e passa direto pro próximo', () => {
+        global.UrlFetchApp.fetch
+          .mockImplementationOnce(slowOverloaded)
+          .mockReturnValueOnce({
+            getResponseCode: () => 200,
+            getContentText: () =>
+              JSON.stringify({
+                candidates: [{ content: { parts: [{ text: JSON.stringify({
+                  valor: 100, categoria: 'Mercado', descricao: 'compras', data: '2026-08-30', precisa_revisao: false,
+                }) }] } }],
+              }),
+          });
+
+        const draft = ai.parseExpense('paguei 100 reais de compras', ['Mercado']);
+
+        expect(draft.descricao).toBe('compras');
+        expect(global.Utilities.sleep).not.toHaveBeenCalled();
+        expect(global.UrlFetchApp.fetch.mock.calls[1][0]).toContain('gemini-3.5-flash');
+      });
+
+      it('para a cadeia antes do limite de 6 min do Apps Script, pra ainda dar tempo de avisar o erro', () => {
+        global.UrlFetchApp.fetch.mockImplementation(slowOverloaded);
+
+        expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/sem tempo para tentar: gemma-4-31b-it/);
+        // 4 chamadas de 60s (flash-latest, 3.5-flash, flash-lite, gemma 26B); a 5ª não caberia no orçamento
+        expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(4);
+        expect(now).toBeLessThanOrEqual(300000);
+      });
+    });
+
     it('não tenta o Gemma para áudio (sem suporte nesses tamanhos)', () => {
       global.UrlFetchApp.fetch.mockReturnValue({
         getResponseCode: () => 503,
