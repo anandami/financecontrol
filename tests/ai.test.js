@@ -174,15 +174,15 @@ describe('ai.js', () => {
       expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('lança um erro com o status e o corpo quando o Gemini responde com erro HTTP não-retriável (em ambos os modelos)', () => {
+    it('lança um erro com o status e o corpo quando o Gemini responde com erro HTTP não-retriável (em todos os modelos)', () => {
       global.UrlFetchApp.fetch.mockReturnValue({
         getResponseCode: () => 400,
         getContentText: () => '{"error":{"message":"Invalid argument"}}',
       });
 
       expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/400/);
-      // 1 tentativa no principal + 1 no modelo de reserva (400 não é retriável em nenhum dos dois)
-      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(2);
+      // 1 tentativa em cada um dos 5 modelos da cadeia (400 não é retriável em nenhum)
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(5);
     });
 
     it('tenta de novo em erro 503 (sobrecarga temporária) e usa a resposta da tentativa seguinte', () => {
@@ -205,15 +205,57 @@ describe('ai.js', () => {
       expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(2);
     });
 
-    it('desiste de vez só depois de esgotar as tentativas no principal E no modelo de reserva', () => {
+    it('desiste de vez só depois de esgotar as tentativas no principal E em todos os modelos de reserva', () => {
       global.UrlFetchApp.fetch.mockReturnValue({
         getResponseCode: () => 503,
         getContentText: () => '{"error":{"message":"overloaded"}}',
       });
 
       expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/503/);
-      // (1 tentativa inicial + 2 retentativas) no principal, e o mesmo no modelo de reserva = 6 chamadas
+      // (1 tentativa inicial + 2 retentativas) no principal + 1 em cada um dos 4 de reserva = 7 chamadas
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(7);
+    });
+
+    it('cai pro Gemma 4 quando todos os Gemini estão sobrecarregados, sem structured output e aceitando JSON em bloco markdown', () => {
+      const overloaded = { getResponseCode: () => 503, getContentText: () => '{"error":{"message":"overloaded"}}' };
+      global.UrlFetchApp.fetch
+        .mockReturnValueOnce(overloaded)
+        .mockReturnValueOnce(overloaded)
+        .mockReturnValueOnce(overloaded)
+        .mockReturnValueOnce(overloaded)
+        .mockReturnValueOnce(overloaded)
+        .mockReturnValueOnce({
+          getResponseCode: () => 200,
+          getContentText: () =>
+            JSON.stringify({
+              candidates: [{ content: { parts: [
+                { text: 'pensando...', thought: true },
+                { text: '```json\n' + JSON.stringify({
+                  valor: 370, categoria: 'Eletrônicos', descricao: 'Galaxy Buds 3', data: '2026-09-24', precisa_revisao: false,
+                }) + '\n```' },
+              ] } }],
+            }),
+        });
+
+      const draft = ai.parseExpense('370 reais no galaxy buds 3', ['Eletrônicos']);
+
+      expect(draft.valor).toBe(370);
       expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(6);
+      const [gemmaUrl, gemmaOptions] = global.UrlFetchApp.fetch.mock.calls[5];
+      expect(gemmaUrl).toContain('gemma-4-26b-a4b-it');
+      expect(JSON.parse(gemmaOptions.payload).generationConfig).toEqual({});
+    });
+
+    it('não tenta o Gemma para áudio (sem suporte nesses tamanhos)', () => {
+      global.UrlFetchApp.fetch.mockReturnValue({
+        getResponseCode: () => 503,
+        getContentText: () => '{"error":{"message":"overloaded"}}',
+      });
+
+      expect(() => ai.parseExpense(null, [], { mimeType: 'audio/ogg', data: 'QUJD' })).toThrow(/503/);
+      // 3 no principal + 1 no gemini-3.5-flash + 1 no flash-lite; nenhum Gemma
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(5);
+      global.UrlFetchApp.fetch.mock.calls.forEach(([url]) => expect(url).not.toContain('gemma'));
     });
 
     it('cai pro modelo de reserva quando a cota diária do modelo principal esgota (429 RESOURCE_EXHAUSTED)', () => {

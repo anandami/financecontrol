@@ -11,22 +11,39 @@ if (typeof require !== 'undefined') {
 }
 
 /**
- * Usa o alias "-latest" mantido pelo Google em vez de fixar uma versão
- * numerada: aponta sempre para o Flash estável mais recente (confirmado via
- * generateContent em 2026-09-02, resolvendo hoje para gemini-3.8-flash), sem
- * precisar atualizar este código quando uma versão for descontinuada — foi
- * exatamente isso que quebrou o parsing de despesas ao fixar "gemini-2.5-flash".
+ * Cadeia de modelos tentados em ordem até um responder. Cada modelo tem cota e
+ * capacidade isoladas, então um 503 ("high demand") ou 429 (cota diária) num
+ * deles não afeta o seguinte.
  *
- * Trade-off descoberto ao vivo: um modelo recém-lançado (é o caso do que
- * "-latest" resolve pra hoje) pode vir com uma cota de estreia no tier
- * gratuito bem mais apertada que o normal (visto: 20 requisições/DIA, contra
- * os ~250-1500/dia esperados). Cada modelo tem sua própria cota isolada, então
- * `GEMINI_FALLBACK_MODEL` (uma versão um pouco mais madura, não a mais nova)
- * serve de plano B só quando a cota diária do principal esgota de vez —
- * ver callGemini().
+ * - `gemini-flash-latest`: alias mantido pelo Google (aponta sempre pro Flash
+ *   estável mais recente — fixar "gemini-2.5-flash" quebrou tudo quando ele foi
+ *   descontinuado). Trade-off visto ao vivo: modelo recém-lançado pode vir com
+ *   cota de estreia apertada (20 req/dia) e sobrecarga.
+ * - `gemini-3.5-flash`: versão um pouco mais madura, mesma qualidade/formato.
+ * - `gemini-3.5-flash-lite`: mais leve, cota separada; rápido (~1-2s nos
+ *   testes ao vivo de 2026-09-24) e ainda aceita áudio e structured output.
+ * - `gemma-4-26b-a4b-it` / `gemma-4-31b-it`: Gemma 4 servido pela mesma API e
+ *   mesma chave, numa infraestrutura/cota separada da família Gemini — é o que
+ *   ainda responde quando os Flash estão todos sobrecarregados. Testado ao vivo
+ *   em 2026-09-24 (texto, lote e foto OK), com ressalvas: bem mais lento
+ *   (15-50s; o 31B chegou a ficar 60s parado antes de um 503, por isso vem por
+ *   último), não aceita áudio nesses tamanhos, e structured output quebra a
+ *   resposta (responseSchema devolveu "{}", responseMimeType deu HTTP 500) —
+ *   então vai sem generationConfig e o formato JSON vem só da instrução no
+ *   prompt, com parse tolerante (ver extractJsonText_/extractResponseText_).
+ *   Em comprovantes ele tende a lançar item por item em vez do total.
+ *
+ * `retries` = retentativas extras para 503 no mesmo modelo. Só o principal
+ * retenta; os de reserva são tentados uma vez cada, para não estourar o tempo
+ * de resposta do webhook quando tudo está sobrecarregado.
  */
-var GEMINI_MODEL = 'gemini-flash-latest';
-var GEMINI_FALLBACK_MODEL = 'gemini-3.5-flash';
+var GEMINI_MODELS = [
+  { name: 'gemini-flash-latest', structuredOutput: true, audio: true, retries: 2 },
+  { name: 'gemini-3.5-flash', structuredOutput: true, audio: true, retries: 0 },
+  { name: 'gemini-3.5-flash-lite', structuredOutput: true, audio: true, retries: 0 },
+  { name: 'gemma-4-26b-a4b-it', structuredOutput: false, audio: false, retries: 0 },
+  { name: 'gemma-4-31b-it', structuredOutput: false, audio: false, retries: 0 },
+];
 var GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 var CATEGORIA_SEM_CORRESPONDENCIA = 'SEM_CATEGORIA';
 var DATA_FORMAT_REGEX = /^\d{4}-\d{2}-\d{2}$/;
@@ -92,17 +109,16 @@ function buildPrompt(text, categories, media) {
   return parts;
 }
 
-var GEMINI_MAX_RETRIES = 2;
 var GEMINI_RETRY_BASE_DELAY_MS = 1000;
 // 503 (sobrecarga momentânea do modelo) é um erro que o próprio Gemini
 // recomenda tentar de novo — visto ao vivo com "This model is currently
 // experiencing high demand... Please try again later." 429 NÃO entra aqui:
 // quando é por cota diária esgotada (RESOURCE_EXHAUSTED), esperar segundos não
-// resolve — o caminho é trocar de modelo (ver callGemini/GEMINI_FALLBACK_MODEL).
+// resolve — o caminho é trocar de modelo (ver callGemini/GEMINI_MODELS).
 var GEMINI_RETRYABLE_STATUS_CODES = [503];
 
-/** Uma tentativa de generateContent contra um modelo específico, com retry para erros transitórios (503). */
-function requestGemini_(model, parts, generationConfig) {
+/** Uma tentativa de generateContent contra um modelo específico, com até `maxRetries` retentativas para erros transitórios (503). */
+function requestGemini_(model, parts, generationConfig, maxRetries) {
   var url = GEMINI_API_BASE + model + ':generateContent?key=' + getGeminiApiKey();
   var payload = {
     contents: [{ parts: parts }],
@@ -124,7 +140,7 @@ function requestGemini_(model, parts, generationConfig) {
       var errorBody = response.getContentText();
       Logger.log('ai.requestGemini_: modelo=' + model + ' HTTP ' + code + ' em ' + elapsedMs + 'ms (tentativa ' + (attempt + 1) + ') - ' + errorBody);
 
-      if (GEMINI_RETRYABLE_STATUS_CODES.indexOf(code) !== -1 && attempt < GEMINI_MAX_RETRIES) {
+      if (GEMINI_RETRYABLE_STATUS_CODES.indexOf(code) !== -1 && attempt < maxRetries) {
         Utilities.sleep(GEMINI_RETRY_BASE_DELAY_MS * (attempt + 1));
         continue;
       }
@@ -143,42 +159,83 @@ function requestGemini_(model, parts, generationConfig) {
   }
 }
 
+function hasAudio_(parts) {
+  return parts.some(function (p) {
+    return p.inline_data && /^audio\//.test(p.inline_data.mime_type || '');
+  });
+}
+
 /**
- * Chama generateContent com as parts dadas, usando o modelo principal
- * (GEMINI_MODEL). Se ele falhar de vez (depois dos próprios retries em
- * requestGemini_) — seja por cota DIÁRIA esgotada (429 RESOURCE_EXHAUSTED;
- * visto ao vivo: tier gratuito de um modelo recém-lançado com limite de só
- * 20 requisições/dia) ou por sobrecarga persistente (503 que não se resolveu
- * nem depois das retentativas) — tenta uma vez o modelo de reserva
- * (GEMINI_FALLBACK_MODEL), que tem cota e capacidade isoladas do principal.
- * `responseSchema` (opcional) força o formato exato da resposta. Lança um
- * erro com o status e o corpo em caso de falha definitiva (em ambos os
- * modelos) — Code.js repassa pro dono via Telegram. Retorna null (sem
+ * Chama generateContent com as parts dadas, percorrendo GEMINI_MODELS em
+ * ordem: se um modelo falhar de vez (depois das próprias retentativas em
+ * requestGemini_) por qualquer motivo — cota diária esgotada (429), sobrecarga
+ * persistente (503), etc. — tenta o próximo. Modelos sem suporte a áudio são
+ * pulados quando a mensagem é uma nota de voz. `responseSchema` (opcional)
+ * força o formato exato da resposta nos modelos que suportam structured
+ * output. Lança um erro com o status e o corpo da última falha se TODOS os
+ * modelos falharem — Code.js repassa pro dono via Telegram. Retorna null (sem
  * lançar) só quando a resposta veio OK mas o corpo não é um JSON válido.
  */
 function callGemini(parts, responseSchema) {
-  var generationConfig = { responseMimeType: 'application/json' };
-  if (responseSchema) {
-    generationConfig.responseSchema = responseSchema;
+  var withAudio = hasAudio_(parts);
+  var models = GEMINI_MODELS.filter(function (m) {
+    return m.audio || !withAudio;
+  });
+
+  var failures = [];
+  var lastErr = null;
+  for (var i = 0; i < models.length; i++) {
+    var model = models[i];
+    var generationConfig = {};
+    if (model.structuredOutput) {
+      generationConfig.responseMimeType = 'application/json';
+      if (responseSchema) {
+        generationConfig.responseSchema = responseSchema;
+      }
+    }
+
+    try {
+      return requestGemini_(model.name, parts, generationConfig, model.retries);
+    } catch (err) {
+      lastErr = err;
+      failures.push(model.name);
+      if (i < models.length - 1) {
+        Logger.log('ai.callGemini: falha definitiva em ' + model.name + ' (' + err + '), tentando ' + models[i + 1].name);
+      }
+    }
   }
 
-  try {
-    return requestGemini_(GEMINI_MODEL, parts, generationConfig);
-  } catch (err) {
-    if (GEMINI_MODEL === GEMINI_FALLBACK_MODEL) {
-      throw err;
-    }
-    Logger.log('ai.callGemini: falha definitiva em ' + GEMINI_MODEL + ' (' + err + '), tentando modelo de reserva ' + GEMINI_FALLBACK_MODEL);
-    return requestGemini_(GEMINI_FALLBACK_MODEL, parts, generationConfig);
-  }
+  throw new Error('Nenhum modelo de IA respondeu (' + failures.join(', ') + '). Última falha: ' + lastErr.message);
 }
 
+/**
+ * Texto gerado pela resposta, ignorando parts de raciocínio ("thought") que
+ * alguns modelos (ex: Gemma 4 com thinking) podem devolver antes da resposta.
+ */
 function extractResponseText_(rawJson) {
   try {
-    return rawJson.candidates[0].content.parts[0].text;
+    var texts = rawJson.candidates[0].content.parts.filter(function (p) {
+      return typeof p.text === 'string' && !p.thought;
+    });
+    return texts.length ? texts[texts.length - 1].text : null;
   } catch (err) {
     return null;
   }
+}
+
+/**
+ * Sem structured output (caso do Gemma), o modelo pode embrulhar o JSON em
+ * bloco de markdown (```json ... ```) ou pôr texto em volta. Recorta do
+ * primeiro "{"/"[" até o último "}"/"]" — pros modelos com structured output
+ * isso é um no-op.
+ */
+function extractJsonText_(text) {
+  var start = text.search(/[\[{]/);
+  var end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+  if (start === -1 || end < start) {
+    return text;
+  }
+  return text.slice(start, end + 1);
 }
 
 function isValidExpenseShape_(obj) {
@@ -204,7 +261,7 @@ function parseExpenseResponse(rawJson) {
 
   var parsed;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(extractJsonText_(text));
   } catch (err) {
     return null;
   }
@@ -284,7 +341,7 @@ function parseExpenseListResponse(rawJson) {
 
   var parsed;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(extractJsonText_(text));
   } catch (err) {
     return null;
   }
