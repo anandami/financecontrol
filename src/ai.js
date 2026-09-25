@@ -13,34 +13,42 @@ if (typeof require !== 'undefined') {
 /**
  * Cadeia de modelos tentados em ordem até um responder. Cada modelo tem cota e
  * capacidade isoladas, então um 503 ("high demand") ou 429 (cota diária) num
- * deles não afeta o seguinte.
+ * deles não afeta o seguinte. Ordem pensada em VELOCIDADE (medida ao vivo com
+ * a chave real em 2026-09-24, mesmos prompts do bot): os "lite" primeiro.
  *
- * - `gemini-flash-latest`: alias mantido pelo Google (aponta sempre pro Flash
- *   estável mais recente — fixar "gemini-2.5-flash" quebrou tudo quando ele foi
- *   descontinuado). Trade-off visto ao vivo: modelo recém-lançado pode vir com
- *   cota de estreia apertada (20 req/dia) e sobrecarga.
- * - `gemini-3.5-flash`: versão um pouco mais madura, mesma qualidade/formato.
- * - `gemini-3.5-flash-lite`: mais leve, cota separada; rápido (~1-2s nos
- *   testes ao vivo de 2026-09-24) e ainda aceita áudio e structured output.
+ * - `gemini-3.5-flash-lite` (principal): ~1-3s em texto, foto, extrato com 9
+ *   linhas, áudio e correção, com o mesmo resultado do 3.5-flash (mesmas 7
+ *   despesas e categorias no extrato) e nenhum 503 nos testes. Versão fixa de
+ *   propósito, não o alias `gemini-flash-lite-latest`: foi um alias "-latest"
+ *   que pôs o bot num modelo recém-lançado, sobrecarregado e com cota de
+ *   estreia de 20 req/dia — a causa das respostas de 40s a 5 min. Se esta
+ *   versão for descontinuada (404), a cadeia só cai pro próximo; vale
+ *   reavaliar periodicamente.
+ * - `gemini-3.1-flash-lite`: geração anterior do lite, capacidade separada,
+ *   mesma qualidade nos testes (1-3s) — segunda opção ainda rápida.
+ * - `gemini-3.5-flash` / `gemini-flash-latest` (hoje 3.8-flash): mais pesados
+ *   (7-16s com raciocínio) e os mais disputados — sob "high demand" o 503
+ *   deles chegou a levar ~60s para voltar. Ficam de reserva.
  * - `gemma-4-26b-a4b-it` / `gemma-4-31b-it`: Gemma 4 servido pela mesma API e
  *   mesma chave, numa infraestrutura/cota separada da família Gemini — é o que
- *   ainda responde quando os Flash estão todos sobrecarregados. Testado ao vivo
- *   em 2026-09-24 (texto, lote e foto OK), com ressalvas: bem mais lento
- *   (15-50s; o 31B chegou a ficar 60s parado antes de um 503, por isso vem por
- *   último), não aceita áudio nesses tamanhos, e structured output quebra a
- *   resposta (responseSchema devolveu "{}", responseMimeType deu HTTP 500) —
- *   então vai sem generationConfig e o formato JSON vem só da instrução no
- *   prompt, com parse tolerante (ver extractJsonText_/extractResponseText_).
- *   Em comprovantes ele tende a lançar item por item em vez do total.
+ *   ainda responde quando os Gemini estão todos sobrecarregados. Testado ao
+ *   vivo (texto, lote e foto OK), com ressalvas: bem mais lento (15-50s; o 31B
+ *   chegou a ficar 60s parado antes de um 503, por isso vem por último), não
+ *   aceita áudio nesses tamanhos, e structured output quebra a resposta
+ *   (responseSchema devolveu "{}", responseMimeType deu HTTP 500) — então vai
+ *   sem generationConfig e o formato JSON vem só da instrução no prompt, com
+ *   parse tolerante (ver extractJsonText_/extractResponseText_). Em
+ *   comprovantes ele tende a lançar item por item em vez do total.
  *
- * `retries` = retentativas extras para 503 no mesmo modelo. Só o principal
- * retenta; os de reserva são tentados uma vez cada, para não estourar o tempo
- * de resposta do webhook quando tudo está sobrecarregado.
+ * `retries` = retentativas extras para 503 rápido no mesmo modelo. Só o
+ * principal retenta; os de reserva são tentados uma vez cada (ver também o
+ * orçamento de tempo em callGemini).
  */
 var GEMINI_MODELS = [
-  { name: 'gemini-flash-latest', structuredOutput: true, audio: true, retries: 2 },
+  { name: 'gemini-3.5-flash-lite', structuredOutput: true, audio: true, retries: 2 },
+  { name: 'gemini-3.1-flash-lite', structuredOutput: true, audio: true, retries: 0 },
   { name: 'gemini-3.5-flash', structuredOutput: true, audio: true, retries: 0 },
-  { name: 'gemini-3.5-flash-lite', structuredOutput: true, audio: true, retries: 0 },
+  { name: 'gemini-flash-latest', structuredOutput: true, audio: true, retries: 0 },
   { name: 'gemma-4-26b-a4b-it', structuredOutput: false, audio: false, retries: 0 },
   { name: 'gemma-4-31b-it', structuredOutput: false, audio: false, retries: 0 },
 ];

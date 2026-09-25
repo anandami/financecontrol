@@ -181,8 +181,8 @@ describe('ai.js', () => {
       });
 
       expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/400/);
-      // 1 tentativa em cada um dos 5 modelos da cadeia (400 não é retriável em nenhum)
-      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(5);
+      // 1 tentativa em cada um dos 6 modelos da cadeia (400 não é retriável em nenhum)
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(6);
     });
 
     it('tenta de novo em erro 503 (sobrecarga temporária) e usa a resposta da tentativa seguinte', () => {
@@ -212,13 +212,14 @@ describe('ai.js', () => {
       });
 
       expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/503/);
-      // (1 tentativa inicial + 2 retentativas) no principal + 1 em cada um dos 4 de reserva = 7 chamadas
-      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(7);
+      // (1 tentativa inicial + 2 retentativas) no principal + 1 em cada um dos 5 de reserva = 8 chamadas
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(8);
     });
 
     it('cai pro Gemma 4 quando todos os Gemini estão sobrecarregados, sem structured output e aceitando JSON em bloco markdown', () => {
       const overloaded = { getResponseCode: () => 503, getContentText: () => '{"error":{"message":"overloaded"}}' };
       global.UrlFetchApp.fetch
+        .mockReturnValueOnce(overloaded)
         .mockReturnValueOnce(overloaded)
         .mockReturnValueOnce(overloaded)
         .mockReturnValueOnce(overloaded)
@@ -240,8 +241,8 @@ describe('ai.js', () => {
       const draft = ai.parseExpense('370 reais no galaxy buds 3', ['Eletrônicos']);
 
       expect(draft.valor).toBe(370);
-      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(6);
-      const [gemmaUrl, gemmaOptions] = global.UrlFetchApp.fetch.mock.calls[5];
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(7);
+      const [gemmaUrl, gemmaOptions] = global.UrlFetchApp.fetch.mock.calls[6];
       expect(gemmaUrl).toContain('gemma-4-26b-a4b-it');
       expect(JSON.parse(gemmaOptions.payload).generationConfig).toEqual({});
     });
@@ -278,14 +279,15 @@ describe('ai.js', () => {
 
         expect(draft.descricao).toBe('compras');
         expect(global.Utilities.sleep).not.toHaveBeenCalled();
-        expect(global.UrlFetchApp.fetch.mock.calls[1][0]).toContain('gemini-3.5-flash');
+        expect(global.UrlFetchApp.fetch.mock.calls[0][0]).toContain('/gemini-3.5-flash-lite:');
+        expect(global.UrlFetchApp.fetch.mock.calls[1][0]).toContain('/gemini-3.1-flash-lite:');
       });
 
       it('para a cadeia antes do limite de 6 min do Apps Script, pra ainda dar tempo de avisar o erro', () => {
         global.UrlFetchApp.fetch.mockImplementation(slowOverloaded);
 
-        expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/sem tempo para tentar: gemma-4-31b-it/);
-        // 4 chamadas de 60s (flash-latest, 3.5-flash, flash-lite, gemma 26B); a 5ª não caberia no orçamento
+        expect(() => ai.parseExpense('paguei 100 reais de faxina', [])).toThrow(/sem tempo para tentar: gemma-4-26b-a4b-it, gemma-4-31b-it/);
+        // 4 chamadas de 60s (os dois lite, 3.5-flash, flash-latest); a 5ª não caberia no orçamento
         expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(4);
         expect(now).toBeLessThanOrEqual(300000);
       });
@@ -298,8 +300,8 @@ describe('ai.js', () => {
       });
 
       expect(() => ai.parseExpense(null, [], { mimeType: 'audio/ogg', data: 'QUJD' })).toThrow(/503/);
-      // 3 no principal + 1 no gemini-3.5-flash + 1 no flash-lite; nenhum Gemma
-      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(5);
+      // 3 no principal + 1 em cada um dos outros 3 Gemini; nenhum Gemma
+      expect(global.UrlFetchApp.fetch).toHaveBeenCalledTimes(6);
       global.UrlFetchApp.fetch.mock.calls.forEach(([url]) => expect(url).not.toContain('gemma'));
     });
 
